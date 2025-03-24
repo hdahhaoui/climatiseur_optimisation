@@ -9,7 +9,8 @@ import re
 st.set_page_config(page_title="Simulateur de Climatisation", page_icon="❄️", layout="wide")
 
 # Clés API (à remplacer par vos propres clés si nécessaire)
-DEESEEK_API_KEY = "sk-c2463319fd4d461d9172e8b5b49936dd"
+DEESEEK_API_KEY = "sk-c2463319fd4d461d9172e8b5b49936dd" 
+MODEL = "deepseek-chat"
 OWM_API_KEY = "420227af9037639d0d68ac9deafead1a"
 
 # Fonctions utilitaires avec mise en cache
