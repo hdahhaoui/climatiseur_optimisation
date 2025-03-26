@@ -4,8 +4,8 @@ import datetime
 import math
 
 # Configuration de l'API (clés à fournir dans les secrets de l'application Streamlit)
-DEEPSEEK_API_KEY = st.secrets.get("DEEPSEEK_API_KEY", None)
-OWM_API_KEY = st.secrets.get("OWM_API_KEY", None)
+DEEPSEEK_API_KEY = st.secrets.get("sk-c2463319fd4d461d9172e8b5b49936dd", None)
+OWM_API_KEY = st.secrets.get("420227af9037639d0d68ac9deafead1a", None)
 
 # Tarif de l'électricité (DZD par kWh)
 TARIF_ELECTRICITE = 5  # 5 DZD/kWh (tarif fixe)
