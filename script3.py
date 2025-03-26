@@ -1,389 +1,451 @@
 import streamlit as st
 import requests
-import pandas as pd
-from bs4 import BeautifulSoup
-from urllib.parse import urlparse, parse_qs, unquote
-import re
-import json
+import datetime
+import math
 
-# Clé API et modèle DeepSeek
-DEEPSEEK_API_KEY = "sk-c2463319fd4d461d9172e8b5b49936dd"
-DEEPSEEK_MODEL = "deepseek-chat-1.3"
+# Configuration de l'API (clés à fournir dans les secrets de l'application Streamlit)
+DEEPSEEK_API_KEY = st.secrets.get("DEEPSEEK_API_KEY", None)
+OWM_API_KEY = st.secrets.get("OWM_API_KEY", None)
 
-# Option pour activer le fallback de scraping local (désactivé par défaut, recommandé sur le Cloud)
-SCRAPING_ENABLED = True  # À désactiver sur Streamlit Cloud
+# Tarif de l'électricité (DZD par kWh)
+TARIF_ELECTRICITE = 5  # 5 DZD/kWh (tarif fixe)
 
-# Fonction pour analyser/convertir une valeur de puissance fournie sous forme de texte (avec unité)
-def parse_power_value(val_str: str):
-    """Convertit une chaîne contenant une puissance (W, kW, BTU/h) en valeur numérique (W)."""
-    s = val_str.strip()
-    s_lower = s.lower()
-    # Retirer d'éventuelles mentions "/h" (ex: "BTU/h") pour simplifier
-    s_lower = s_lower.replace('/h', '').replace('hour', '')
-    match = re.search(r'(\d+[\d\.\,]*)\s*(kw|w|btu)', s_lower)
-    if not match:
-        return None
-    num_str, unit = match.groups()
-    try:
-        value = float(num_str.replace(',', '.'))
-    except:
-        return None
-    unit = unit.lower()
-    if unit == 'w':
-        return value
-    if unit == 'kw':
-        return value * 1000
-    if unit == 'btu':
-        # 1 BTU/h ≈ 0.29307 W
-        return value * 0.29307107
-    return value
+# Liste prédéfinie de 16 villes algériennes avec leurs coordonnées (latitude, longitude)
+VILLES = {
+    "Adrar": (27.867, -0.283),
+    "Alger": (36.753, 3.058),
+    "Annaba": (36.90, 7.766),
+    "Batna": (35.556, 6.174),
+    "Béchar": (31.617, -2.217),
+    "Béjaïa": (36.756, 5.084),
+    "Biskra": (34.850, 5.730),
+    "Constantine": (36.365, 6.615),
+    "Ghardaïa": (32.490, 3.670),
+    "Laghouat": (33.800, 2.865),
+    "Oran": (35.699, -0.636),
+    "Ouargla": (31.949, 5.325),
+    "Sétif": (36.191, 5.414),
+    "Tamanrasset": (22.785, 5.525),
+    "Tizi Ouzou": (36.717, 4.050),
+    "Tlemcen": (34.882, -1.314)
+}
 
-# Fonction pour extraire la classe énergétique depuis un texte (A, A+, A++, ..., G)
-def find_energy_class(text: str):
-    """Recherche la classe énergétique (A...G avec +) dans le texte."""
-    # Recherche d'une mention explicite "classe énergétique" ou "energy class"
-    lines = text.splitlines()
-    for segment in lines:
-        seg_lower = segment.lower()
-        if "classe énergétique" in seg_lower or "classe energetique" in seg_lower or "energy class" in seg_lower:
-            # Isoler la partie après ":" (s'il y en a) pour trouver la valeur de classe
-            part = segment
-            if ':' in segment:
-                part = segment.split(':', 1)[1]
-            match = re.search(r'\b([A-G]\+{0,3})\b', part.strip())
-            if match:
-                return match.group(1)
-    # Si pas de libellé explicite, on cherche toute mention de A+/A++...
-    match = re.search(r'\b([A-G]\+{1,3})\b', text)
-    if match:
-        return match.group(1)
-    return None
+# Titre de l'application
+st.title("Simulation de consommation énergétique d'un climatiseur")
 
-# Fonction principale pour parser la réponse de l'API DeepSeek ou du texte extrait d'une page web
-def parse_ac_specs(text_response: str):
-    """
-    Extrait les données de consommation, puissance frigorifique, technologie inverter et classe énergétique
-    à partir d'une réponse textuelle (JSON ou texte structuré).
-    """
-    data = {"consumption_w": None, "cooling_w": None, "inverter": None, "energy_class": None}
-    if not text_response:
-        return data
-    text = text_response.strip()
+# Section 1: Introduction du modèle de climatiseur et récupération des données techniques via DeepSeek
+st.header("1. Caractéristiques du climatiseur")
 
-    # 1. Tentative de parser en JSON structuré si la réponse semble être du JSON
-    if text.startswith('{') or text.startswith('['):
+# Champ de texte pour entrer le modèle du climatiseur
+modele = st.text_input("Modèle du climatiseur :", value="", help="Entrez la référence exacte du climatiseur (ex: Marque Modèle 1234)")
+
+# Bouton pour interroger l'API DeepSeek avec le modèle saisi
+deepseek_result = None
+if st.button("Obtenir les données techniques via l'IA DeepSeek"):
+    if DEEPSEEK_API_KEY:
+        # Préparation de la requête à l'API DeepSeek (format compatible OpenAI)
+        import openai
+        openai.api_base = "https://api.deepseek.com/v1"
+        openai.api_key = DEEPSEEK_API_KEY
+        # Formulation de la demande pour obtenir les caractéristiques du climatiseur
+        prompt = f"Fournis les caractéristiques techniques du climatiseur {modele} : consommation électrique (en kW), puissance frigorifique (en kW) et préciser s'il s'agit d'un modèle inverter ou non."
         try:
-            resp_json = json.loads(text)
-        except json.JSONDecodeError:
-            resp_json = None
-        if resp_json:
-            # Parcourir les éléments JSON pour trouver nos champs d'intérêt
-            # (les clés peuvent être en français ou anglais selon la réponse)
-            for key, val in resp_json.items() if isinstance(resp_json, dict) else []:
-                key_low = key.lower()
-                if "consommation" in key_low or "consumption" in key_low or "puissance absorb" in key_low or "power" in key_low:
-                    # Consommation électrique
-                    if isinstance(val, (int, float)):
-                        data["consumption_w"] = float(val)
-                    elif isinstance(val, str):
-                        conv = parse_power_value(val)
-                        if conv is not None:
-                            data["consumption_w"] = conv
-                if "frigorifique" in key_low or "cooling" in key_low or "capacity" in key_low or "cold" in key_low:
-                    # Puissance frigorifique
-                    if isinstance(val, (int, float)):
-                        data["cooling_w"] = float(val)
-                    elif isinstance(val, str):
-                        conv = parse_power_value(val)
-                        if conv is not None:
-                            data["cooling_w"] = conv
-                if "inverter" in key_low or "technologie" in key_low or "technology" in key_low:
-                    # Technologie (Inverter ou non)
-                    if isinstance(val, bool):
-                        data["inverter"] = "Inverter" if val else "Non-Inverter"
-                    elif isinstance(val, str):
-                        inv_val = val.lower()
-                        if "non" in inv_val or "pas" in inv_val or inv_val in ["false", "no", "0"]:
-                            data["inverter"] = "Non-Inverter"
-                        elif "inverter" in inv_val or inv_val in ["true", "oui", "yes", "1"]:
-                            data["inverter"] = "Inverter"
-                        else:
-                            data["inverter"] = val  # valeur textuelle telle quelle si autre
-                if "classe" in key_low or "class" in key_low or "rating" in key_low:
-                    # Classe énergétique
-                    if isinstance(val, str):
-                        data["energy_class"] = val.strip()
-                    else:
-                        data["energy_class"] = str(val)
-            # Si on a obtenu consommation et puissance, on peut retourner directement
-            if data["consumption_w"] is not None and data["cooling_w"] is not None:
-                # Nettoyage finale des valeurs (au cas où en string)
-                if isinstance(data["consumption_w"], str):
-                    data["consumption_w"] = parse_power_value(data["consumption_w"])
-                if isinstance(data["cooling_w"], str):
-                    data["cooling_w"] = parse_power_value(data["cooling_w"])
-                return data
-    # 2. Si la réponse n'est pas JSON ou incomplète, on parse en texte libre structuré
-    lower = text.lower()
-    # Rechercher toutes les occurrences de nombres suivis d'unités W, kW ou BTU
-    matches = re.findall(r'(\d+[\d\.\,]*)(?:\s*)(kw|w|btu)', lower)
-    cons_val = None
-    cool_val = None
-    for num_str, unit in matches:
-        try:
-            value = float(num_str.replace(',', '.'))
-        except:
-            continue
-        unit = unit.lower()
-        if unit == 'w':
-            watts = value
-        elif unit == 'kw':
-            watts = value * 1000
-        elif unit == 'btu':
-            watts = value * 0.29307107  # conversion BTU->W
-        else:
-            watts = value
-        # Chercher des mots-clés autour du nombre pour déterminer s'il s'agit de la consommation ou de la puissance frigorifique
-        idx = lower.find(num_str + unit)
-        context = lower[max(0, idx-20): idx+20] if idx != -1 else ""
-        if any(word in context for word in ["consommation", "consomm\u00e9e", "absorbé", "absorbee", "electri", "input"]):
-            cons_val = watts
-        if any(word in context for word in ["frigorifique", "calorifique", "froid", "rafraich", "cooling", "capacity"]):
-            cool_val = watts
-    # S'il n'y a pas eu de contexte clair, tenter d'attribuer par différence de magnitude (généralement, puissance frigorifique >> consommation)
-    if (cons_val is None or cool_val is None) and len(matches) == 2:
-        vals = []
-        for num_str, unit in matches:
-            try:
-                v = float(num_str.replace(',', '.'))
-            except:
-                continue
-            if unit.lower() == 'w':
-                v_w = v
-            elif unit.lower() == 'kw':
-                v_w = v * 1000
-            elif unit.lower() == 'btu':
-                v_w = v * 0.29307107
+            response = openai.ChatCompletion.create(
+                model="deepseek-chat",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2
+            )
+            deepseek_text = response["choices"][0]["message"]["content"]
+            # Extraction basique des données depuis la réponse texte de l'IA
+            # On cherche des nombres dans le texte pour consommation et puissance, et les mots "inverter" ou "non-inverter"
+            conso_val = None
+            froid_val = None
+            inverter_val = None
+            # Parcours du texte pour trouver des chiffres (kW) et le mot inverter
+            import re
+            # Chercher consommation électrique en kW
+            match_conso = re.search(r'consommation.*?([\d\.]+)\s*kW', deepseek_text, re.IGNORECASE)
+            if match_conso:
+                conso_val = float(match_conso.group(1))
+            # Chercher puissance frigorifique en kW ou BTU (convertir BTU en kW si nécessaire)
+            match_froid = re.search(r'puissance frigorifique.*?([\d\.]+)\s*kW', deepseek_text, re.IGNORECASE)
+            if match_froid:
+                froid_val = float(match_froid.group(1))
             else:
-                v_w = v
-            vals.append(v_w)
-        if len(vals) == 2:
-            # Plus grand = puissance frigorifique, plus petit = consommation (supposé)
-            if vals[0] > vals[1]:
-                cool_val = vals[0]
-                cons_val = vals[1]
+                match_froid_btu = re.search(r'puissance frigorifique.*?([\d\,]+)\s*BTU', deepseek_text, re.IGNORECASE)
+                if match_froid_btu:
+                    try:
+                        btu_val = float(match_froid_btu.group(1).replace(',', ''))
+                        froid_val = round(btu_val * 0.00029307107, 2)  # conversion BTU/h -> kW
+                    except:
+                        froid_val = None
+            # Chercher mention inverter
+            if re.search(r'inverter', deepseek_text, re.IGNORECASE):
+                # Si le texte contient "non inverter" explicitement
+                if re.search(r'non inverter', deepseek_text, re.IGNORECASE) or re.search(r"pas inverter", deepseek_text, re.IGNORECASE):
+                    inverter_val = False
+                else:
+                    inverter_val = True
+            # Stocker les résultats partiels dans l'état de session
+            st.session_state["ac_modele"] = modele
+            st.session_state["ac_conso"] = conso_val
+            st.session_state["ac_froid"] = froid_val
+            st.session_state["ac_inverter"] = inverter_val
+            # Indiquer si DeepSeek a réussi à fournir des données complètes
+            if conso_val and froid_val and inverter_val is not None:
+                st.session_state["ac_data_ok"] = True
             else:
-                cool_val = vals[1]
-                cons_val = vals[0]
-    data["consumption_w"] = cons_val
-    data["cooling_w"] = cool_val
-    # Technologie inverter (oui/non)
-    if "inverter" in lower:
-        # Si on trouve explicitement "non inverter" ou "pas inverter"
-        if "non inverter" in lower or "pas inverter" in lower:
-            data["inverter"] = "Non-Inverter"
-        else:
-            data["inverter"] = "Inverter"
-    # Classe énergétique (A, A+, A++, ...)
-    data["energy_class"] = find_energy_class(text) or data["energy_class"]
-    return data
-
-# Fonction d'interrogation de l'API DeepSeek
-def fetch_specs_from_deepseek(model: str):
-    """Interroge l’API DeepSeek pour le modèle donné et renvoie le texte de réponse."""
-    api_url = "https://api.deepseek.com/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    # Préparation du prompt pour ne demander que les données essentielles
-    user_prompt = (
-        f"Fiche technique simplifiée pour le climatiseur \"{model}\" : "
-        "donne uniquement la consommation électrique (en W), la puissance frigorifique (en W), "
-        "la technologie (inverter ou non) et la classe énergétique si disponible."
-    )
-    # Messages du chat : on peut ajouter un rôle système pour cadrer la réponse
-    messages = [
-        {"role": "system", "content": "Vous êtes un assistant technique qui fournit des données chiffrées précises."},
-        {"role": "user", "content": user_prompt}
-    ]
-    payload = {
-        "model": DEEPSEEK_MODEL,
-        "messages": messages,
-        "temperature": 0,
-        "max_tokens": 300
-    }
-    try:
-        res = requests.post(api_url, headers=headers, json=payload, timeout=10)
-        if res.status_code == 200:
-            # L'API DeepSeek est compatible avec le format OpenAI
-            response_json = res.json()
-            # Extraire le contenu de la réponse de l'assistant
-            answer = response_json["choices"][0]["message"]["content"]
-            return answer
-        else:
-            # En cas de code de statut non OK, on lève une exception pour gérer le fallback
-            raise Exception(f"HTTP {res.status_code}: {res.text}")
-    except Exception as e:
-        # On retourne None si échec (géré par le fallback ensuite)
-        print(f"Erreur API DeepSeek: {e}")
-        return None
-
-# Fonction de fallback : scraping web pour obtenir les spécifications
-def fetch_specs_via_scraping(model: str):
-    """Recherche les spécifications du modèle via scraping (recherche Google simulée) et renvoie les données extraites."""
-    query = f"{model} climatiseur fiche technique"
-    # URL de recherche Google (note: peut être bloqué sur certaines plateformes)
-    search_url = "https://www.google.com/search?q=" + requests.utils.requote_uri(query)
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        res = requests.get(search_url, headers=headers, timeout=5)
-    except Exception as e:
-        return None
-    if res.status_code != 200:
-        return None
-    soup = BeautifulSoup(res.text, 'html.parser')
-    result_link = None
-    # Extraire le premier lien de résultat (en évitant les liens internes Google)
-    for a in soup.find_all('a', href=True):
-        href = a['href']
-        if href.startswith('/url?'):
-            parsed = urlparse(href)
-            qs = parse_qs(parsed.query)
-            url = qs.get('q', [None])[0]
-            if url:
-                url = unquote(url)
-                # Ignorer les liens Google ou YouTube, ainsi que les PDF (non parsables ici)
-                if "google." in url or "youtube.com" in url or url.lower().endswith(('.pdf', '.PDF')):
-                    continue
-                result_link = url
-                break
-    if not result_link:
-        return None
-    # Télécharger la page du premier résultat
-    try:
-        page_res = requests.get(result_link, headers=headers, timeout=5)
-    except Exception as e:
-        return None
-    if page_res.status_code != 200:
-        return None
-    page_html = page_res.text
-    soup_page = BeautifulSoup(page_html, 'html.parser')
-    # Supprimer les scripts et styles pour ne garder que le texte utile
-    for script in soup_page(["script", "style"]):
-        script.decompose()
-    text = soup_page.get_text(separator=" ")
-    data = parse_ac_specs(text)
-    # Vérifier si on a bien obtenu les valeurs essentielles, sinon tenter un deuxième lien de résultat
-    if (data.get("consumption_w") is None or data.get("cooling_w") is None):
-        # Essayer le lien suivant dans la page de résultats
-        second_link = None
-        for a in soup.find_all('a', href=True):
-            href = a['href']
-            if href.startswith('/url?'):
-                parsed = urlparse(href)
-                qs = parse_qs(parsed.query)
-                url = qs.get('q', [None])[0]
-                if not url:
-                    continue
-                url = unquote(url)
-                if "google." in url or "youtube.com" in url or url.lower().endswith(('.pdf', '.PDF')):
-                    continue
-                # passer le premier lien qu'on a déjà utilisé
-                if result_link and url == result_link:
-                    continue
-                second_link = url
-                break
-        if second_link:
-            try:
-                page_res2 = requests.get(second_link, headers=headers, timeout=5)
-                if page_res2.status_code == 200:
-                    soup_page2 = BeautifulSoup(page_res2.text, 'html.parser')
-                    for script in soup_page2(["script", "style"]):
-                        script.decompose()
-                    text2 = soup_page2.get_text(separator=" ")
-                    data2 = parse_ac_specs(text2)
-                    # Compléter les données manquantes avec ce second résultat
-                    for key in data2:
-                        if data.get(key) is None and data2.get(key) is not None:
-                            data[key] = data2[key]
-            except Exception:
-                pass
-    return data
-
-# Définition de l'interface Streamlit
-st.title("🌀 Simulation de consommation d'un climatiseur")
-st.write("Cet outil récupère automatiquement les caractéristiques techniques essentielles d’un climatiseur (via API et web) afin de simuler sa consommation énergétique sur une journée.")
-
-# Champ de saisie pour le modèle de climatiseur
-model_name = st.text_input("**Modèle du climatiseur** (référence exacte) :", placeholder="Exemple : Samsung AR12TXFCAWKN")
-if SCRAPING_ENABLED:
-    st.warning("🔎 Le **scraping web** est activé pour la récupération de données (à utiliser de préférence en local).")
-else:
-    st.info("ℹ️ Le scraping web est désactivé par défaut (recommandé sur Streamlit Cloud). Seule l'API DeepSeek sera utilisée.")
-
-# Bouton de recherche
-if st.button("🔍 Obtenir les caractéristiques et simuler la consommation"):
-    if not model_name.strip():
-        st.error("Veuillez saisir un nom ou modèle de climatiseur pour continuer.")
+                st.session_state["ac_data_ok"] = False
+        except Exception as e:
+            st.error("Échec de la récupération via l'API DeepSeek.")
+            st.session_state["ac_data_ok"] = False
     else:
-        # Appel en priorité à l'API DeepSeek
-        st.write(f"**Recherche des données pour \"{model_name}\"...**")
-        api_response = fetch_specs_from_deepseek(model_name.strip())
-        data = None
-        if api_response:
-            # Parser la réponse de l'API
-            data = parse_ac_specs(api_response)
-        # Si l'API n'a pas répondu ou données incomplètes, tenter le fallback
-        if data is None or data.get("consumption_w") is None or data.get("cooling_w") is None:
-            st.warning("L'API DeepSeek n'a pas fourni toutes les informations nécessaires. Activation du mode secours (scraping web)...")
-            if SCRAPING_ENABLED:
-                data = fetch_specs_via_scraping(model_name.strip())
+        st.warning("Clé API DeepSeek non configurée. Veuillez entrer les données manuellement.")
+        st.session_state["ac_data_ok"] = False
+
+# Si DeepSeek a échoué ou n'a pas fourni toutes les infos, on affiche le formulaire manuel
+if "ac_data_ok" in st.session_state and st.session_state["ac_data_ok"] == False:
+    st.write("**Veuillez renseigner manuellement les caractéristiques du climatiseur :**")
+    # Champs manuels pour consommation, puissance et inverter
+    # Si DeepSeek a renvoyé partiellement des infos, on pré-remplit les champs correspondants
+    conso_def = st.session_state.get("ac_conso", None)
+    froid_def = st.session_state.get("ac_froid", None)
+    inverter_def = st.session_state.get("ac_inverter", None)
+    if conso_def is None:
+        conso_def = 1.0  # valeur par défaut 1 kW si inconnue
+    if froid_def is None:
+        froid_def = 3.5  # par défaut 3.5 kW (~12000 BTU) si inconnue
+    # Interface du formulaire manuel
+    conso_input = st.number_input("Consommation électrique (kW) :", min_value=0.1, max_value=10.0, value=float(conso_def), step=0.1)
+    froid_input = st.number_input("Puissance frigorifique (kW) :", min_value=0.5, max_value=20.0, value=float(froid_def), step=0.1)
+    inverter_input = st.radio("Technologie inverter :", options=["Oui", "Non"], index=(0 if inverter_def else 1) if inverter_def is not None else 0)
+    # Convertir le choix radio en booléen
+    inverter_bool = True if inverter_input == "Oui" else False
+    # Bouton pour valider les données manuelles
+    if st.button("Valider les données du climatiseur"):
+        st.session_state["ac_modele"] = modele or "Modèle inconnu"
+        st.session_state["ac_conso"] = float(conso_input)
+        st.session_state["ac_froid"] = float(froid_input)
+        st.session_state["ac_inverter"] = inverter_bool
+        st.session_state["ac_data_ok"] = True
+
+# Si on a des données complètes (via DeepSeek ou formulaire), afficher le résumé des caractéristiques techniques
+if st.session_state.get("ac_data_ok", False):
+    st.success("Caractéristiques du climatiseur prêtes.")
+    # Récupération des données depuis l'état de session
+    modele_confirme = st.session_state.get("ac_modele", "N/A")
+    conso_confirme = st.session_state.get("ac_conso", None)
+    froid_confirme = st.session_state.get("ac_froid", None)
+    inverter_confirme = st.session_state.get("ac_inverter", None)
+    # Affichage du résumé
+    st.subheader("Résumé des caractéristiques techniques :")
+    st.write(f"- **Modèle** : {modele_confirme}")
+    if conso_confirme is not None:
+        st.write(f"- **Consommation électrique** : {conso_confirme} kW")
+    if froid_confirme is not None:
+        st.write(f"- **Puissance frigorifique** : {froid_confirme} kW")
+    if inverter_confirme is not None:
+        st.write(f"- **Technologie inverter** : {'Oui' if inverter_confirme else 'Non'}")
+# Section 2: Paramètres d'utilisation et météo
+st.header("2. Paramètres d'utilisation et conditions météo")
+
+# Sélection de la ville
+liste_villes = list(VILLES.keys())
+ville_index_defaut = liste_villes.index("Tlemcen") if "Tlemcen" in liste_villes else 0
+ville_choisie = st.selectbox("Ville :", options=liste_villes, index=ville_index_defaut)
+lat, lon = VILLES[ville_choisie]
+
+# Nombre d'heures d'utilisation quotidienne
+heures_utilisation = st.number_input("Nombre d'heures d'utilisation quotidienne :", min_value=1, max_value=24, value=8, step=1)
+
+# Surface de la pièce (m²)
+surface = st.number_input("Surface de la pièce (en m²) :", min_value=5, max_value=200, value=20, step=1)
+
+# Niveau d'isolation
+isolation = st.selectbox("Niveau d'isolation de la pièce :", options=["Bonne", "Moyenne", "Faible"], index=1)
+
+# Présence de fenêtres exposées au soleil
+fenetres_soleil = st.selectbox("Fenêtres exposées au soleil :", options=["Oui", "Non"], index=1)
+fenetres_soleil_bool = (fenetres_soleil == "Oui")
+
+# Nombre de personnes dans la pièce
+personnes = st.number_input("Nombre de personnes présentes dans la pièce :", min_value=1, max_value=20, value=1, step=1)
+
+# Température de confort souhaitée (°C)
+temp_confort = st.number_input("Température de confort souhaitée (°C) :", min_value=16, max_value=30, value=24, step=1)
+
+# Affichage de la météo actuelle et prévisions à 14 jours pour la ville sélectionnée
+st.subheader(f"Météo à {ville_choisie}")
+
+meteo_actuelle = None
+previsions_jours = None
+if OWM_API_KEY:
+    try:
+        # Appel API OpenWeatherMap pour la météo actuelle
+        url_current = f"http://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&units=metric&lang=fr&appid={OWM_API_KEY}"
+        res_current = requests.get(url_current)
+        data_current = res_current.json() if res_current.status_code == 200 else {}
+        # Appel API pour les prévisions quotidiennes sur 14 jours
+        url_daily = f"http://api.openweathermap.org/data/2.5/forecast/daily?lat={lat}&lon={lon}&cnt=14&units=metric&lang=fr&appid={OWM_API_KEY}"
+        res_daily = requests.get(url_daily)
+        data_daily = res_daily.json() if res_daily.status_code == 200 else {}
+        # Appel API OneCall pour obtenir des prévisions horaires (48h) plus précises
+        url_onecall = f"http://api.openweathermap.org/data/2.5/onecall?lat={lat}&lon={lon}&exclude=minutely,alerts&units=metric&lang=fr&appid={OWM_API_KEY}"
+        res_onecall = requests.get(url_onecall)
+        data_onecall = res_onecall.json() if res_onecall.status_code == 200 else {}
+    except Exception as e:
+        st.error("Échec de la récupération des données météo.")
+        data_current = {}
+        data_daily = {}
+        data_onecall = {}
+
+    # Traiter la météo actuelle
+    if data_current.get("weather"):
+        desc = data_current["weather"][0]["description"].capitalize()
+        temp_now = data_current["main"]["temp"]
+        humid = data_current["main"].get("humidity", None)
+        meteo_actuelle = f"{desc}, {temp_now:.1f} °C"
+        if humid is not None:
+            meteo_actuelle += f", Humidité {humid}%"
+        st.write(f"**Météo actuelle** : {meteo_actuelle}")
+    else:
+        st.write("Météo actuelle non disponible.")
+
+    # Traiter les prévisions sur 14 jours
+    if data_daily.get("list"):
+        previsions_jours = []
+        timezone_offset = 0
+        if "city" in data_daily and "timezone" in data_daily["city"]:
+            timezone_offset = data_daily["city"]["timezone"]
+        for entry in data_daily["list"]:
+            dt_ts = entry.get("dt")
+            if dt_ts:
+                # Convertir le timestamp en date locale
+                date_locale = datetime.datetime.utcfromtimestamp(dt_ts + timezone_offset)
+                date_str = date_locale.strftime("%d %b")
             else:
-                data = None  # Scraping désactivé, on restera None
-        # Vérifier si on a bien obtenu des données exploitables
-        if data is None or data.get("consumption_w") is None or data.get("cooling_w") is None:
-            st.error("❌ Impossible de trouver les caractéristiques complètes pour ce modèle. Veuillez vérifier le nom du modèle ou essayer un autre modèle.")
+                date_str = "N/A"
+            temp_min = entry.get("temp", {}).get("min")
+            temp_max = entry.get("temp", {}).get("max")
+            desc_day = entry.get("weather", [{}])[0].get("description", "")
+            previsions_jours.append({
+                "Date": date_str,
+                "Min (°C)": f"{temp_min:.1f}" if temp_min is not None else "",
+                "Max (°C)": f"{temp_max:.1f}" if temp_max is not None else "",
+                "Temps": desc_day
+            })
+        # Afficher la table des prévisions (14 jours)
+        st.write("**Prévisions 14 jours :**")
+        st.table(previsions_jours)
+    else:
+        st.write("Prévisions 14 jours non disponibles.")
+else:
+    st.warning("Clé API OpenWeatherMap non fournie. Impossible d'afficher les données météo.")
+
+# Analyse automatique des heures optimales d'utilisation sur la base de la météo (recommandations)
+st.subheader("Recommandations d'utilisation optimisée")
+if previsions_jours:
+    # On utilise le premier jour de la liste pour baser nos conseils (jour actuel ou prochain)
+    premier_jour = previsions_jours[0]
+    try:
+        max_temp = float(premier_jour["Max (°C)"])
+        min_temp = float(premier_jour["Min (°C)"])
+    except:
+        max_temp = None
+        min_temp = None
+    if max_temp is not None and max_temp >= 32:
+        st.info("**Conseil :** Évitez d'utiliser la climatisation entre **13h et 16h** car il fera très chaud à ce moment-là.")
+    elif max_temp is not None and max_temp >= 25:
+        st.info("**Conseil :** Limitez l'utilisation aux heures les moins chaudes de la journée (matinée ou fin d'après-midi) pour économiser de l'énergie.")
+    if min_temp is not None and min_temp < temp_confort:
+        st.info("**Conseil :** Profitez de la fraîcheur en début de journée en **laissant les fenêtres ouvertes le matin** pour refroidir la pièce naturellement.")
+    elif min_temp is not None and min_temp < 20:
+        st.info("**Conseil :** La nuit sera plus fraîche, pensez à aérer la pièce tard le soir ou tôt le matin pour réduire le besoin de climatisation.")
+else:
+    st.write("Aucun conseil disponible sans données météo.")
+
+# Section 3: Simulation des deux scénarios (normal vs optimisé)
+st.header("3. Simulation de la consommation : Scénario normal vs optimisé")
+
+# Bouton pour lancer la simulation
+if st.button("Lancer la simulation"):
+    # Vérifier que les caractéristiques du climatiseur sont disponibles
+    if not st.session_state.get("ac_data_ok", False):
+        st.error("Veuillez d'abord renseigner les caractéristiques du climatiseur (section 1).")
+    else:
+        # Récupérer les données du climatiseur
+        consommation_kw = st.session_state.get("ac_conso", 1.0)  # puissance électrique en kW
+        puissance_frigo_kw = st.session_state.get("ac_froid", 2.0)  # puissance frigorifique en kW
+        est_inverter = st.session_state.get("ac_inverter", True)
+
+        # Préparation des variables de simulation
+        heures_totales = 24
+        # Déterminer la plage horaire d'occupation (scénario normal : climatiseur allumé toute la période d'occupation)
+        X = int(heures_utilisation)
+        if X > heures_totales:
+            X = heures_totales
+        start_hour = 0
+        end_hour = heures_totales - 1
+        if X <= 12:
+            # On centre la plage d'utilisation autour de 15h (pic de chaleur vers milieu de journée)
+            center = 15
+            start_hour = max(0, center - math.floor(X/2))
+            end_hour = start_hour + X - 1
+            if end_hour > 23:
+                end_hour = 23
+                start_hour = end_hour - X + 1
         else:
-            # Arrondi des valeurs numériques pour affichage (Watts)
-            cons_w = int(round(data["consumption_w"])) if data.get("consumption_w") is not None else None
-            cool_w = int(round(data["cooling_w"])) if data.get("cooling_w") is not None else None
-            inv_tech = data.get("inverter")
-            energy_class = data.get("energy_class")
+            # Si l'occupation est longue (>12h), on la fait s'étendre jusqu'à la fin de la journée
+            start_hour = max(0, heures_totales - X)
+            end_hour = 23
 
-            # Affichage des caractéristiques récupérées
-            st.subheader("Caractéristiques techniques essentielles")
-            cols = st.columns([1,1,1,1])
-            cols[0].metric("Consommation électrique", f"{cons_w} W" if cons_w is not None else "N/A")
-            cols[1].metric("Puissance frigorifique", f"{cool_w} W" if cool_w is not None else "N/A")
-            # Pour technologie inverter, afficher Oui/Non ou valeur textuelle
-            if inv_tech:
-                if inv_tech.lower().startswith("non"):
-                    cols[2].metric("Technologie", "Non-Inverter")
+        # Récupérer les prévisions horaires sur les 24 prochaines heures (si disponibles)
+        outside_temps = [None] * heures_totales
+        if OWM_API_KEY and 'data_onecall' in locals() and data_onecall.get("hourly"):
+            # Utiliser les 24 premières heures de data_onecall
+            for i in range(min(24, len(data_onecall["hourly"]))):
+                outside_temps[i] = data_onecall["hourly"][i]["temp"]
+            # S'il manque des heures, on tente de compléter avec min/max journaliers de data_daily
+            if None in outside_temps and data_daily.get("list"):
+                # Utiliser une interpolation simple basée sur les temp min/max du jour
+                if data_daily["list"]:
+                    day_info = data_daily["list"][0]
+                    t_min = day_info.get("temp", {}).get("min", temp_confort)
+                    t_max = day_info.get("temp", {}).get("max", temp_confort)
+                    # Approximation : min à 6h, max à 15h, forme triangulaire
+                    for h in range(heures_totales):
+                        if outside_temps[h] is None:
+                            if h < 6:
+                                outside_temps[h] = t_min + (h / 6.0) * (day_info["temp"]["morn"] - t_min if "morn" in day_info["temp"] else 0)
+                            elif 6 <= h <= 15:
+                                # croissance linéaire de t_min à t_max
+                                outside_temps[h] = t_min + (t_max - t_min) * ((h-6) / (15-6))
+                            else:
+                                # décroissance linéaire de t_max vers t_min (nuit)
+                                outside_temps[h] = t_max - (t_max - t_min) * ((h-15) / (24-15))
+        else:
+            # Pas de données horaires, on utilise les min/max de la première journée pour estimer la courbe
+            t_min = 20.0
+            t_max = 30.0
+            if previsions_jours:
+                try:
+                    t_min = float(previsions_jours[0]["Min (°C)"])
+                    t_max = float(previsions_jours[0]["Max (°C)"])
+                except:
+                    pass
+            for h in range(heures_totales):
+                if h < 6:
+                    outside_temps[h] = t_min
+                elif 6 <= h <= 15:
+                    outside_temps[h] = t_min + (t_max - t_min) * ((h-6) / (15-6))
                 else:
-                    cols[2].metric("Technologie", "Inverter")
-            else:
-                cols[2].metric("Technologie", "N/A")
-            cols[3].metric("Classe énergétique", energy_class if energy_class else "N/A")
+                    outside_temps[h] = t_max - (t_max - t_min) * ((h-15) / (24-15))
 
-            # Choix du nombre d'heures de fonctionnement par jour pour la simulation
-            st.subheader("Simulation de la consommation sur 24h")
-            st.write("Réglez le profil d'utilisation quotidienne du climatiseur :")
-            hours = st.slider("Heures de fonctionnement par jour", min_value=0, max_value=24, value=8)
-            if cons_w is None:
-                st.error("Donnée de consommation indisponible, impossible de calculer la consommation énergétique.")
-            else:
-                if hours <= 0:
-                    st.info("Choisissez un nombre d'heures d'utilisation supérieur à 0 pour calculer la consommation.")
+        # Listes de consommation horaire pour chaque scénario
+        consommation_horaire_normale = [0.0] * heures_totales
+        consommation_horaire_optimisee = [0.0] * heures_totales
+
+        for h in range(heures_totales):
+            if start_hour <= h <= end_hour:
+                # Scénario normal : climatiseur allumé en continu pendant l'occupation (pleine puissance)
+                consommation_horaire_normale[h] = consommation_kw
+                # Scénario optimisé : régulation intelligente
+                # Calcul de la différence de température entre l'extérieur et la température de confort
+                temp_ext = outside_temps[h] if outside_temps[h] is not None else temp_confort
+                diff = max(0.0, temp_ext - temp_confort)
+                # Ajustement en fonction de l'isolation
+                if isolation == "Bonne":
+                    diff *= 0.8
+                elif isolation == "Faible":
+                    diff *= 1.2
+                # Ajustement si fenêtres exposées au soleil (on considère un impact surtout aux heures chaudes)
+                if fenetres_soleil_bool and 10 <= h <= 16:
+                    diff *= 1.1
+                # Ajustement en fonction du nombre de personnes (chaleur interne)
+                diff *= (1 + 0.05 * (personnes - 1))
+                # Calcul du facteur de fonctionnement de la clim (0 à 1)
+                # On suppose qu'à +10°C d'écart ou plus, la clim tourne à 100% de sa capacité
+                facteur_utilisation = diff / 10.0
+                if facteur_utilisation > 1:
+                    facteur_utilisation = 1.0
+                if facteur_utilisation < 0:
+                    facteur_utilisation = 0.0
+                # Prise en compte de la technologie inverter (meilleure efficacité à charge partielle)
+                if est_inverter:
+                    facteur_utilisation *= 0.95  # léger gain d'efficacité
                 else:
-                    # Calcul de la consommation journalière
-                    daily_wh = cons_w * hours  # en Wh
-                    daily_kwh = daily_wh / 1000.0
-                    st.write(f"**Consommation journalière estimée** (pour {hours}h de fonctionnement) : **{daily_kwh:.2f} kWh**")
-                    # Détail horaire (simple répartition sur les premières 'hours' heures de la journée)
-                    profile = [cons_w/1000.0 if i < hours else 0 for i in range(24)]
-                    df_profile = pd.DataFrame({"Consommation horaire (kWh)": profile}, index=[f"{h}h" for h in range(24)])
-                    st.bar_chart(df_profile, height=200)
-                    st.caption("Profil de consommation sur 24h (les heures où le climatiseur est allumé sont supposées consommer la puissance nominale).")
+                    facteur_utilisation *= 1.05  # un non-inverter peut consommer un peu plus pour la même tâche
+                if facteur_utilisation > 1:
+                    facteur_utilisation = 1.0
+                # Consommation optimisée à cette heure (kW * fraction du temps)
+                consommation_horaire_optimisee[h] = consommation_kw * facteur_utilisation
+            else:
+                # En dehors des heures d'occupation, le climatiseur est éteint dans les deux scénarios
+                consommation_horaire_normale[h] = 0.0
+                consommation_horaire_optimisee[h] = 0.0
 
-# Fin du code
+        # Calcul des consommations totales quotidiennes (kWh par jour)
+        total_kwh_normal = sum(consommation_horaire_normale)
+        total_kwh_optimise = sum(consommation_horaire_optimisee)
+        # Calcul des coûts quotidiens correspondants
+        cout_normal = total_kwh_normal * TARIF_ELECTRICITE
+        cout_optimise = total_kwh_optimise * TARIF_ELECTRICITE
+
+        # Affichage des résultats numériques
+        st.subheader("Résultats de la simulation :")
+        st.write(f"- **Consommation quotidienne - Scénario normal** : {total_kwh_normal:.1f} kWh (coût ≈ {cout_normal:.0f} DZD par jour)")
+        st.write(f"- **Consommation quotidienne - Scénario optimisé** : {total_kwh_optimise:.1f} kWh (coût ≈ {cout_optimise:.0f} DZD par jour)")
+        # Comparaison et économies
+        economie_kwh = total_kwh_normal - total_kwh_optimise
+        economie_pourcent = (economie_kwh / total_kwh_normal * 100) if total_kwh_normal > 0 else 0.0
+        economie_cout = cout_normal - cout_optimise
+        st.write(f"- **Économies potentielles réalisées** : {economie_kwh:.1f} kWh par jour, soit **{economie_pourcent:.0f}%** de moins, ce qui représente environ {economie_cout:.0f} DZD économisés par jour.")
+
+        # Graphique horaire de la consommation pour les deux scénarios
+        st.subheader("Profil horaire de consommation électrique")
+        import pandas as pd
+        heures = list(range(24))
+        df_conso = pd.DataFrame({
+            "Heure": heures,
+            "Consommation normale (kW)": consommation_horaire_normale,
+            "Consommation optimisée (kW)": consommation_horaire_optimisee
+        })
+        df_conso = df_conso.set_index("Heure")
+        st.line_chart(df_conso)
+
+        # Section 4: Rapport automatique par IA DeepSeek
+        st.header("4. Rapport d'analyse par IA")
+        if DEEPSEEK_API_KEY:
+            try:
+                # Préparation de la requête à l'IA DeepSeek pour le rapport
+                rapport_prompt = (
+                    "Vous êtes un expert en efficacité énergétique. "
+                    "Analysez les résultats de simulation suivants pour un climatiseur domestique :\n"
+                    f"- Modèle : {st.session_state.get('ac_modele', 'N/A')}\n"
+                    f"- Inverter : {'oui' if est_inverter else 'non'}\n"
+                    f"- Puissance frigorifique : {puissance_frigo_kw} kW\n"
+                    f"- Consommation électrique : {consommation_kw} kW\n"
+                    f"- Ville : {ville_choisie}\n"
+                    f"- Isolation : {isolation}\n"
+                    f"- Fenêtres ensoleillées : {'oui' if fenetres_soleil_bool else 'non'}\n"
+                    f"- Personnes dans la pièce : {personnes}\n"
+                    f"- Température de confort : {temp_confort} °C\n"
+                    f"- Heures d'utilisation par jour : {X} h\n"
+                    f"- Consommation journalière scénario normal : {total_kwh_normal:.1f} kWh (coût {cout_normal:.0f} DZD)\n"
+                    f"- Consommation journalière scénario optimisé : {total_kwh_optimise:.1f} kWh (coût {cout_optimise:.0f} DZD)\n"
+                    f"- Économie réalisée : {economie_kwh:.1f} kWh/jour ({economie_pourcent:.0f}% de réduction, {economie_cout:.0f} DZD économisés)\n\n"
+                    "Rédigez un bref rapport commentant ces résultats, en soulignant les économies d'énergie possibles et la pertinence des choix d'utilisation (isolation, horaires, technologie inverter, etc.)."
+                )
+                rapport_response = openai.ChatCompletion.create(
+                    model="deepseek-chat",
+                    messages=[{"role": "user", "content": rapport_prompt}],
+                    temperature=0.2,
+                    max_tokens=512
+                )
+                rapport_texte = rapport_response["choices"][0]["message"]["content"]
+                st.write(rapport_texte)
+            except Exception as e:
+                st.error("Erreur lors de la génération du rapport IA DeepSeek.")
+        else:
+            st.info("Veuillez configurer la clé API DeepSeek pour générer le rapport d'analyse automatique.")
+
