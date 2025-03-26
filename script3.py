@@ -8,10 +8,10 @@ import json
 
 # Clé API et modèle DeepSeek
 DEEPSEEK_API_KEY = "sk-c2463319fd4d461d9172e8b5b49936dd"
-DEEPSEEK_MODEL = "deepseek-chat"
+DEEPSEEK_MODEL = "deepseek-chat-1.3"
 
 # Option pour activer le fallback de scraping local (désactivé par défaut, recommandé sur le Cloud)
-SCRAPING_ENABLED = False  # Passer à True en local si l'API DeepSeek ne suffit pas
+SCRAPING_ENABLED = True  # À désactiver sur Streamlit Cloud
 
 # Fonction pour analyser/convertir une valeur de puissance fournie sous forme de texte (avec unité)
 def parse_power_value(val_str: str):
