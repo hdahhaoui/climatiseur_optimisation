@@ -7,6 +7,7 @@ import math
 DEEPSEEK_API_KEY = st.secrets.get("DEEPSEEK_API_KEY", None)
 OWM_API_KEY = st.secrets.get("OWM_API_KEY", None)
 
+
 # Tarif de l'électricité (DZD par kWh)
 TARIF_ELECTRICITE = 5  # 5 DZD/kWh (tarif fixe)
 
