@@ -7,7 +7,8 @@ import pandas as pd
 import altair as alt
 
 # Clés API (doivent être configurées dans les secrets de l'application Streamlit)
-DEEPSEEK_API_KEY = st.secrets.get("DEEPSEEK_KEY", None)
+DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_KEY"]
+#DEEPSEEK_API_KEY = st.secrets.get("DEEPSEEK_KEY", None)
 OWM_API_KEY = st.secrets.get("OWMAPI_KEY", None)
 
 # Tarif de l'électricité (DZD par kWh) - constant
