@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import datetime
 import math
+import openai
 import pandas as pd
 import altair as alt
 
